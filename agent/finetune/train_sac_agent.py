@@ -1,7 +1,7 @@
 """
 Soft Actor Critic (SAC) agent training script.
 
-Does not support image observations right now. 
+Does not support image observations right now.
 """
 
 import os

@@ -27,7 +27,7 @@ class TrainPPOAgent(TrainAgent):
         # note the discount factor gamma here is applied to reward every act_steps, instead of every env step
         self.gamma = cfg.train.gamma
 
-        # Wwarm up period for critic before actor updates
+        # Warm up period for critic before actor updates
         self.n_critic_warmup_itr = cfg.train.n_critic_warmup_itr
 
         # Optimizer
