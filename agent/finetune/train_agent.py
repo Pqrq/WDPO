@@ -37,6 +37,7 @@ class TrainAgent:
                 config=OmegaConf.to_container(cfg, resolve=True),
             )
 
+        # NEW: Buralara dikkat, environment ayarları burada yapılıyor sanırım
         # Make vectorized env
         self.env_name = cfg.env.name
         env_type = cfg.env.get("env_type", None)
