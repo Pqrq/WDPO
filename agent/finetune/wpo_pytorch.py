@@ -9,7 +9,7 @@ import torch.optim as optim
 import numpy as np
 import logging
 
-from env.new_bandit import KArmedBanditEnv
+from env.bandit import KArmedBanditEnv
 
 
 
