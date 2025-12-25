@@ -62,6 +62,7 @@ class TrainWPOAgent(TrainAgent):
         self.gamma = cfg.train.gamma
         self.target_update_period = cfg.train.target_update_period
         self.warmup_steps = cfg.train.warmup_steps
+        self.tau = cfg.train.tau
 
         self.epsilon_mean = cfg.train.epsilon_mean
         self.epsilon_std = cfg.train.epsilon_std
@@ -163,9 +164,12 @@ class TrainWPOAgent(TrainAgent):
                 for u in range(n_updates):
                     stats = self._update()
 
-                    # Target Hard Update
-                    if (self.total_env_steps - self.n_steps + u) % self.target_update_period == 0:
-                        self.model.hard_update_targets()
+                    # Hard Target Update
+                    # if (self.total_env_steps - self.n_steps + u) % self.target_update_period == 0:
+                    #     self.model.hard_update_targets()
+
+                    # Soft Target Update
+                    self.model.soft_update_targets(tau=self.tau)
 
                     # Aggregate stats
                     if u == 0:

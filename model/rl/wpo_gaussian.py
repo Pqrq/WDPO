@@ -106,3 +106,18 @@ class WPO_Gaussian(nn.Module):
     def hard_update_targets(self):
         self.target_actor.load_state_dict(self.actor.state_dict())
         self.target_critic.load_state_dict(self.critic.state_dict())
+
+    def soft_update_targets(self, tau=0.005):
+        """
+        Polyak averaging: target = tau * current + (1-tau) * target
+        """
+        with torch.no_grad():
+            # Update Actor Targets
+            for param, target_param in zip(self.actor.parameters(), self.target_actor.parameters()):
+                target_param.data.mul_(1 - tau)
+                torch.add(target_param.data, param.data, alpha=tau, out=target_param.data)
+
+            # Update Critic Targets
+            for param, target_param in zip(self.critic.parameters(), self.target_critic.parameters()):
+                target_param.data.mul_(1 - tau)
+                torch.add(target_param.data, param.data, alpha=tau, out=target_param.data)
