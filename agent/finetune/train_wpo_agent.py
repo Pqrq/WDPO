@@ -1,213 +1,351 @@
+import os
+import pickle
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.optim as optim
-import torch.nn.functional as F
-from torch.distributions import Normal, Independent
-
-import copy
+import logging
 import wandb
-import gymnasium as gym
-from gymnasium import spaces
-from stable_baselines3 import PPO, SAC
-from stable_baselines3.common.callbacks import BaseCallback
+import copy
+from torch import optim
+import torch.nn.functional as F
 
-from agent.finetune.wpo_loss import WPOLoss
-from env.bandit import ContinuousBanditEnv
+from torch.distributions import Normal, Independent, kl_divergence
 
-# --- Neural Network Architectures ---
-
-class PolicyNet(nn.Module):
-    def __init__(self, obs_dim, act_dim, hidden_dim=64):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(obs_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU()
-        )
-        self.mean_head = nn.Linear(hidden_dim, act_dim)
-        self.log_std_head = nn.Linear(hidden_dim, act_dim)
-
-    def forward(self, x):
-        feat = self.net(x)
-        mu = self.mean_head(feat)
-        log_std = self.log_std_head(feat)
-        # Clamping log_std for stability is good practice
-        log_std = torch.clamp(log_std, min=-20, max=2)
-        std = torch.exp(log_std)
-
-        # Return Independent Normal to match WPOLoss expectations
-        return Independent(Normal(loc=mu, scale=std), reinterpreted_batch_ndims=1)
+log = logging.getLogger(__name__)
+from util.timer import Timer
+from agent.finetune.train_agent import TrainAgent
 
 
-class QNet(nn.Module):
-    def __init__(self, obs_dim, act_dim, hidden_dim=64):
-        super().__init__()
-        # Input: Concatenation of State and Action
-        self.net = nn.Sequential(
-            nn.Linear(obs_dim + act_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1)
-        )
-
-    def forward(self, obs, act):
-        x = torch.cat([obs, act], dim=-1)
-        return self.net(x)
-
-
-# --- WPO Agent ---
-
-class WPOAgent(nn.Module):
-    def __init__(
-            self,
-            env,
-            hidden_dim=64,
-            lr_policy=3e-4,
-            lr_critic=1e-3,
-            lr_dual=1e-2,  # Dual variables often need faster adjustment
-            device="cpu"
-    ):
-        super().__init__()
-        self.env = env
+# --- Replay Buffer ---
+class ReplayBuffer:
+    def __init__(self, obs_dim, act_dim, max_size=100000, device="cpu"):
+        self.max_size = max_size
+        self.ptr = 0
+        self.size = 0
         self.device = device
 
-        # Dimensions
-        # Handle cases where observation is scalar or array
-        self.obs_dim = env.observation_space.shape[0]
-        self.act_dim = env.action_space.shape[0]
+        self.obs = np.zeros((max_size, obs_dim), dtype=np.float32)
+        self.next_obs = np.zeros((max_size, obs_dim), dtype=np.float32)
+        self.actions = np.zeros((max_size, act_dim), dtype=np.float32)
+        self.rewards = np.zeros((max_size, 1), dtype=np.float32)
+        self.dones = np.zeros((max_size, 1), dtype=np.float32)
 
-        # 1. Networks
-        self.policy = PolicyNet(self.obs_dim, self.act_dim, hidden_dim).to(device)
-        # Target policy for KL constraints (Old Policy)
-        self.target_policy = copy.deepcopy(self.policy).to(device)
-        self.target_policy.eval()  # Target is frozen during update
+    def add(self, obs, action, reward, next_obs, done):
+        # Handle vector env inputs
+        n_samples = obs.shape[0]
+        indices = np.arange(self.ptr, self.ptr + n_samples) % self.max_size
 
-        # Critic (Q-Function) - Essential for WPO Gradient
-        self.q_net = QNet(self.obs_dim, self.act_dim, hidden_dim).to(device)
+        self.obs[indices] = obs
+        self.next_obs[indices] = next_obs
+        self.actions[indices] = action
+        self.rewards[indices] = reward
+        self.dones[indices] = done
 
-        # 2. WPO Loss Module
-        self.wpo_loss_module = WPOLoss(action_dim=self.act_dim).to(device)
+        self.ptr = (self.ptr + n_samples) % self.max_size
+        self.size = min(self.size + n_samples, self.max_size)
 
-        # 3. Optimizers
-        self.policy_opt = optim.Adam(self.policy.parameters(), lr=lr_policy)
-        self.q_opt = optim.Adam(self.q_net.parameters(), lr=lr_critic)
+    def sample(self, batch_size):
+        ind = np.random.randint(0, self.size, size=batch_size)
+        return (
+            torch.FloatTensor(self.obs[ind]).to(self.device),
+            torch.FloatTensor(self.actions[ind]).to(self.device),
+            torch.FloatTensor(self.rewards[ind]).to(self.device),
+            torch.FloatTensor(self.next_obs[ind]).to(self.device),
+            torch.FloatTensor(self.dones[ind]).to(self.device)
+        )
 
-        # Optimizer for the dual variables (alphas) inside WPOLoss
-        self.alpha_opt = optim.Adam(self.wpo_loss_module.parameters(), lr=lr_dual)
 
-    def learn(self, total_timesteps):
-        """
-        Main training loop for Bandits/Simple Env
-        """
-        obs, _ = self.env.reset()
+class TrainWPOAgent(TrainAgent):
+    def __init__(self, cfg):
+        super().__init__(cfg)
 
-        for step in range(total_timesteps):
-            # --- 1. Data Collection ---
-            # Convert obs to tensor
-            obs_tensor = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
+        # WPO Hyperparams from Config
+        self.gamma = cfg.train.gamma
+        self.target_update_period = cfg.train.target_update_period
+        self.warmup_steps = cfg.train.warmup_steps
 
-            # Get Action distribution and sample
-            with torch.no_grad():
-                dist = self.policy(obs_tensor)
-                action = dist.sample()  # [1, act_dim]
-                action_np = action.cpu().numpy()[0]
+        self.epsilon_mean = cfg.train.epsilon_mean
+        self.epsilon_std = cfg.train.epsilon_std
+        self.policy_loss_scale = cfg.train.policy_loss_scale
+        self.kl_loss_scale = cfg.train.kl_loss_scale
+        self.dual_loss_scale = cfg.train.dual_loss_scale
+        self.per_dim_constraining = cfg.train.per_dim_constraining
 
-            # Step Environment
-            next_obs, reward, terminated, truncated, _ = self.env.step(action_np)
-            done = terminated or truncated
+        # Pass specific args to the model wrapper manually since they aren't in the default instantiation
+        self.model.log_alpha_mean.data.fill_(cfg.train.init_log_alpha_mean)
+        self.model.log_alpha_std.data.fill_(cfg.train.init_log_alpha_std)
 
-            # --- 2. Update Step ---
-            stats = self._update(obs_tensor, action, reward)
+        # Optimizers
+        self.actor_optimizer = optim.Adam(
+            self.model.actor.parameters(), lr=cfg.train.actor_lr
+        )
+        self.critic_optimizer = optim.Adam(
+            self.model.critic.parameters(), lr=cfg.train.critic_lr
+        )
+        self.dual_optimizer = optim.Adam(
+            [self.model.log_alpha_mean, self.model.log_alpha_std], lr=cfg.train.dual_lr
+        )
 
-            # --- 3. Logging ---
-            log_dict = {
-                "WPO/reward": reward,
-                "WPO/step": step,
-                **{f"WPO_debug/{k}": v for k, v in stats.items()}
-            }
-            wandb.log(log_dict)
+        # Buffer
+        self.replay_buffer = ReplayBuffer(
+            self.obs_dim * self.n_cond_step,
+            self.action_dim,
+            cfg.train.buffer_size,
+            self.device
+        )
 
-            # Reset if done (though usually not needed for pure Bandits)
-            if done:
-                obs, _ = self.env.reset()
+        # Total env steps counter
+        self.total_env_steps = 0
+
+    def run(self):
+        timer = Timer()
+
+        # Initialize envs
+        obs_venv = self.reset_env_all()
+
+        while self.itr < self.n_train_itr:
+
+            # --- 1. Evaluation Mode ---
+            eval_mode = self.itr % self.val_freq == 0 and not self.force_train
+            if eval_mode:
+                self.model.eval()
+                # Run evaluation logic (simplified for brevity, usually involves separate rollout loop)
+                pass
             else:
-                obs = next_obs
+                self.model.train()
 
-    def _update(self, obs, action, reward):
-        """
-        Performs Q-learning update and WPO Policy update.
-        """
-        # Ensure inputs are tensors on device
-        reward = torch.FloatTensor([reward]).unsqueeze(1).to(self.device)  # [1, 1]
+            # --- 2. Rollout Step (Collect Data) ---
+            episode_rewards = np.zeros(self.n_envs).tolist()
+            for step in range(self.n_steps):
+                if step % 100 == 0:
+                    log.info(f"Collecting step {step}/{self.n_steps}")
+
+                # Select Action
+                with torch.no_grad():
+                    # Obs shape: [n_envs, n_cond_step, obs_dim] -> Flatten for MLP
+                    # The MLP expects [n_envs, n_cond_step * obs_dim]
+                    flat_obs = obs_venv['state'].reshape(self.n_envs, -1)
+                    flat_obs_torch = torch.FloatTensor(flat_obs).to(self.device)
+                    samples = self.model(flat_obs_torch, deterministic=False)
+                    action_venv = samples.cpu().numpy()
+
+                # Step Env
+                next_obs_venv, reward_venv, terminated_venv, truncated_venv, info_venv = self.venv.step(action_venv)
+                done_venv = terminated_venv | truncated_venv
+
+                # Store in Buffer
+                # We flatten observation for the buffer to match network input
+                flat_next_obs = next_obs_venv['state'].reshape(self.n_envs, -1)
+
+                # Expand rewards/dones for buffer dimensions [n_envs, 1]
+                self.replay_buffer.add(
+                    flat_obs,
+                    action_venv,
+                    reward_venv[:, None],
+                    flat_next_obs,
+                    done_venv[:, None]
+                )
+
+                # Update State
+                obs_venv = next_obs_venv
+                self.total_env_steps += self.n_envs
+
+                # reward logging (keep original for logging)
+                episode_rewards = episode_rewards + reward_venv
+
+            # --- 3. Training Step (Update) ---
+            if self.total_env_steps >= self.warmup_steps:
+                update_stats = {}
+                # Perform K updates per iteration (usually matches n_steps or defined ratio)
+                # Here we do 1 update per env step collected, or batch it.
+                # Let's do a fixed number of updates per iteration.
+                n_updates = self.n_steps  # Simple 1-to-1 ratio
+
+                for u in range(n_updates):
+                    stats = self._update()
+
+                    # Target Hard Update
+                    if (self.total_env_steps - self.n_steps + u) % self.target_update_period == 0:
+                        self.model.hard_update_targets()
+
+                    # Aggregate stats
+                    if u == 0:
+                        update_stats = stats
+                    else:
+                        for k, v in stats.items():
+                            update_stats[k] += v
+
+                # Average stats
+                for k in update_stats.keys():
+                    update_stats[k] /= n_updates
+
+            else:
+                update_stats = {}
+
+            # --- 4. Logging & Saving ---
+            avg_reward = np.mean(episode_rewards)
+
+            if self.itr % self.log_freq == 0:
+                time = timer()
+                log.info(
+                    f"Itr {self.itr}: Steps {self.total_env_steps} | "
+                    f"Reward {avg_reward:.4f} | "
+                    f"Loss {update_stats.get('wpo_loss', 0):.4f} | "
+                    f"Time {time:.2f}"
+                )
+
+                if self.use_wandb:
+                    wandb_logs = {
+                        "total_env_steps": self.total_env_steps,
+                        "train/episode_reward": avg_reward,
+                        **{f"train/{k}": v for k, v in update_stats.items()}
+                    }
+                    wandb.log(wandb_logs, step=self.itr)
+
+            if self.itr % self.save_model_freq == 0:
+                self.save_model()
+
+            self.itr += 1
+
+    def _update(self):
+        # Sample Batch
+        obs, actions, rewards, next_obs, dones = self.replay_buffer.sample(self.batch_size)
 
         # ==========================
-        # A. Critic Update (MSE)
+        # A. Critic Update
         # ==========================
-        # For bandits: Target is just Reward (Gamma=0)
-        # For sequential: Target = r + gamma * V(next_s)
-        q_pred = self.q_net(obs, action)
-        q_loss = F.mse_loss(q_pred, reward)
+        with torch.no_grad():
+            N_TARGET_SAMPLES = 8
+            # Get distribution from target actor
+            # Note: Model expects 'cond' input
+            flat_obs = obs.reshape(self.batch_size, -1)
+            next_dist = self.model.target_actor(flat_obs)
 
-        self.q_opt.zero_grad()
+            # [B, N, D]
+            next_actions_sampled = next_dist.sample((N_TARGET_SAMPLES,)).transpose(0, 1)
+
+            # Average Target Q-Values
+            # Expand next_obs: [B, D] -> [B, N, D] -> [B*N, D]
+            next_obs_expanded = next_obs.unsqueeze(1).expand(-1, N_TARGET_SAMPLES, -1).reshape(-1, obs.shape[1])
+            flat_actions = next_actions_sampled.reshape(-1, self.action_dim)
+
+            # Target Critic expects (cond, action)
+            target_q_values = self.model.get_q(next_obs_expanded, flat_actions, target=True)
+
+            # Reshape back [B, N] and mean
+            target_q_mean = target_q_values.reshape(self.batch_size, N_TARGET_SAMPLES).mean(dim=1, keepdim=True)
+
+            y = rewards + self.gamma * (1 - dones) * target_q_mean
+
+        # Update Critic
+        # current_q shape [256], y shape [256, 1] -> Unsqueeze current_q
+        current_q = self.model.get_q(obs, actions).unsqueeze(1)
+        q_loss = F.mse_loss(current_q, y)
+
+        self.critic_optimizer.zero_grad()
         q_loss.backward()
-        self.q_opt.step()
+
+        torch.nn.utils.clip_grad_norm_(self.model.critic.parameters(), max_norm=10.0)
+
+        self.critic_optimizer.step()
 
         # ==========================
-        # B. WPO Policy Update
+        # B. Actor Update
         # ==========================
 
-        # 1. Update Target Policy (Old Policy)
-        # In this simple loop, we set target = policy BEFORE the update
-        # effectively constraining the update to stay close to where we just were.
-        self.target_policy.load_state_dict(self.policy.state_dict())
+        # 1. Distributions
+        policy_dist = self.model.actor(obs)  # Current
+        target_dist = self.model.target_actor(obs)  # Constraint Target
 
-        # 2. Re-evaluate distribution (to track gradients)
-        policy_dist = self.policy(obs)
-        target_policy_dist = self.target_policy(obs)
-
-        # 3. Calculate Q-Gradient w.r.t Action (The "Drift" direction)
-        # We need to sample actions from the CURRENT policy to differentiate through it?
-        # WPO formulation usually takes samples and moves them.
-        # Here we re-sample 'N' actions for stable gradient estimation.
-        N_SAMPLES = 16
-        # [B, N, D] -> [1, 16, D]
-        actions_sampled = policy_dist.sample((N_SAMPLES,)).transpose(0, 1)
-
-        # We need grad of Q(s, a) w.r.t a
+        # 2. Sample N actions from Current Actor
+        N_ACTOR_SAMPLES = 8
+        actions_sampled = policy_dist.sample((N_ACTOR_SAMPLES,)).transpose(0, 1)
         actions_sampled.requires_grad_(True)
-        # Expand obs to match samples: [1, D] -> [1, 1, D] -> [1, N, D]
-        obs_expanded = obs.unsqueeze(1).expand(-1, N_SAMPLES, -1)
 
-        # Flatten for Q-net: [B*N, ...]
-        q_vals = self.q_net(
-            obs_expanded.reshape(-1, self.obs_dim),
-            actions_sampled.reshape(-1, self.act_dim)
-        )
-        q_vals = q_vals.sum()  # Scalar for backward
+        # 3. Calculate Q-Gradient (Drift)
+        obs_expanded = obs.unsqueeze(1).expand(-1, N_ACTOR_SAMPLES, -1).reshape(-1, obs.shape[1])
+        flat_sampled_actions = actions_sampled.reshape(-1, self.action_dim)
 
-        # Compute Gradients
-        grads = torch.autograd.grad(q_vals, actions_sampled, create_graph=False)[0]
-        # q_grad_wrt_actions: [B, N, D]
+        # Use UPDATED critic
+        q_vals = self.model.get_q(obs_expanded, flat_sampled_actions)
+        q_sum = q_vals.sum()
 
-        # 4. Compute WPO Loss
-        loss, wpo_stats = self.wpo_loss_module(
-            policy_dist=policy_dist,
-            target_policy_dist=target_policy_dist,
-            actions_sampled=actions_sampled.detach(),  # Detach actions, we only need the grad direction
-            q_grad_wrt_actions=grads.detach()  # Treat Q-grad as constant vector field
+        grads = torch.autograd.grad(q_sum, actions_sampled, create_graph=False)[0]
+
+        # 4. WPO Loss
+        total_loss, stats = self.wpo_loss(
+            policy_dist, target_dist, actions_sampled.detach(), grads.detach()
         )
 
-        # 5. Optimize Policy and Dual Variables
-        self.policy_opt.zero_grad()
-        self.alpha_opt.zero_grad()
+        self.actor_optimizer.zero_grad()
+        self.dual_optimizer.zero_grad()
+        total_loss.backward()
 
-        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.model.actor.parameters(), max_norm=10.0)
+        torch.nn.utils.clip_grad_norm_([self.model.log_alpha_mean, self.model.log_alpha_std], max_norm=10.0)
 
-        self.policy_opt.step()
-        self.alpha_opt.step()
+        self.actor_optimizer.step()
+        self.dual_optimizer.step()
 
-        wpo_stats['q_loss'] = q_loss.item()
-        return wpo_stats
+        stats['q_loss'] = q_loss.item()
+        return stats
+
+    def wpo_loss(
+            self,
+            policy_dist,
+            target_policy_dist,
+            actions_sampled,
+            q_grad_wrt_actions
+    ):
+        # 1. Unpack
+        mu = policy_dist.base_dist.loc
+        sigma = policy_dist.base_dist.scale
+        target_mu = target_policy_dist.base_dist.loc
+        target_sigma = target_policy_dist.base_dist.scale
+
+        # 2. Wasserstein Drift
+        avg_q_grad = torch.mean(q_grad_wrt_actions, dim=1)
+        drift_target_mu = (sigma.pow(2) * avg_q_grad).detach()
+        loss_policy_drift = -torch.sum(mu * drift_target_mu, dim=-1).mean()
+
+        # 3. KL Constraints
+        dist_fixed_std = Normal(loc=mu, scale=target_sigma.detach())
+        dist_fixed_mean = Normal(loc=target_mu.detach(), scale=sigma)
+        target_dist_base = Normal(loc=target_mu.detach(), scale=target_sigma.detach())
+
+        kl_mean = kl_divergence(target_dist_base, dist_fixed_std)
+        kl_std = kl_divergence(target_dist_base, dist_fixed_mean)
+
+        if not self.per_dim_constraining:
+            kl_mean = kl_mean.sum(dim=-1, keepdim=True)
+            kl_std = kl_std.sum(dim=-1, keepdim=True)
+
+        mean_kl_mean = kl_mean.mean(dim=0)
+        mean_kl_std = kl_std.mean(dim=0)
+
+        # 4. Dual Losses
+        alpha_mean = self.model.get_alpha(self.model.log_alpha_mean)
+        alpha_std = self.model.get_alpha(self.model.log_alpha_std)
+
+        alpha_mean = torch.clamp(alpha_mean, max=100.0) # Clamp to prevent from dominating drift too much in the loss calculation
+        alpha_std = torch.clamp(alpha_std, max=100.0)
+
+        loss_kl_penalty = torch.sum(alpha_mean.detach() * mean_kl_mean) + \
+                          torch.sum(alpha_std.detach() * mean_kl_std)
+
+        loss_dual = torch.sum(alpha_mean * (self.epsilon_mean - mean_kl_mean.detach())) + \
+                    torch.sum(alpha_std * (self.epsilon_std - mean_kl_std.detach()))
+
+        total_loss = (
+                self.policy_loss_scale * loss_policy_drift +
+                self.kl_loss_scale * loss_kl_penalty +
+                self.dual_loss_scale * loss_dual
+        )
+
+        return total_loss, {
+            "wpo_loss": total_loss.item(),
+            "loss_drift": loss_policy_drift.item(),
+            "loss_dual": loss_dual.item(),
+            "kl_mean": mean_kl_mean.mean().item(),
+            "kl_std": mean_kl_std.mean().item(),
+            "alpha_mean": alpha_mean.mean().item()
+        }
