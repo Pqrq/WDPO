@@ -39,7 +39,6 @@ class WPOLoss(nn.Module):
         self,
         policy_dist: Independent,
         target_policy_dist: Independent,
-        actions_sampled: torch.Tensor,    # [B, N, D]
         q_grad_wrt_actions: torch.Tensor, # [B, N, D]
     ):
         # 1. Unpack Distributions (Assume Normal)
