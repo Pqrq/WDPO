@@ -97,7 +97,6 @@ class WPO_Gaussian(nn.Module):
         net = self.target_critic if target else self.critic
 
         # CriticObsAct returns (q1, q2) if double_q=True, else q1
-        # We assume double_q=False for now to match your WPO algorithm 1-to-1
         return net(cond, action)
 
     def get_alpha(self, log_alpha):

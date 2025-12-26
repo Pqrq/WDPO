@@ -233,17 +233,24 @@ class TrainWPOAgent(TrainAgent):
             flat_actions = next_actions_sampled.reshape(-1, self.action_dim)
 
             # Target Critic expects (cond, action)
-            target_q_values = self.model.get_q(next_obs_expanded, flat_actions, target=True)
+            target_q1, target_q2 = self.model.get_q(next_obs_expanded, flat_actions, target=True)
 
             # Reshape back [B, N] and mean
-            target_q_mean = target_q_values.reshape(self.batch_size, N_TARGET_SAMPLES).mean(dim=1, keepdim=True)
+            target_q1 = target_q1.reshape(self.batch_size, N_TARGET_SAMPLES).mean(dim=1, keepdim=True)
+            target_q2 = target_q2.reshape(self.batch_size, N_TARGET_SAMPLES).mean(dim=1, keepdim=True)
+            target_q_min = torch.min(target_q1, target_q2)
 
-            y = rewards + self.gamma * (1 - dones) * target_q_mean
+            y = rewards + self.gamma * (1 - dones) * target_q_min
 
         # Update Critic
-        # current_q shape [256], y shape [256, 1] -> Unsqueeze current_q
-        current_q = self.model.get_q(obs, actions).unsqueeze(1)
-        q_loss = F.mse_loss(current_q, y)
+        # q1 shape [256], y shape [256, 1] -> Unsqueeze q
+        q1, q2 = self.model.get_q(obs, actions)
+        q1 = q1.unsqueeze(1)
+        q2 = q2.unsqueeze(1)
+
+        q1_loss = F.mse_loss(q1, y)
+        q2_loss = F.mse_loss(q2, y)
+        q_loss = q1_loss + q2_loss
 
         self.critic_optimizer.zero_grad()
         q_loss.backward()
@@ -270,7 +277,8 @@ class TrainWPOAgent(TrainAgent):
         flat_sampled_actions = actions_sampled.reshape(-1, self.action_dim)
 
         # Use UPDATED critic
-        q_vals = self.model.get_q(obs_expanded, flat_sampled_actions)
+        q_vals_tuple = self.model.get_q(obs_expanded, flat_sampled_actions)
+        q_vals = q_vals_tuple[0] # Use Q1's gradients for flow calculation, whichever Q is not important
         q_sum = q_vals.sum()
 
         grads = torch.autograd.grad(q_sum, actions_sampled, create_graph=False)[0]
