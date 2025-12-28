@@ -5,6 +5,7 @@ import torch
 import logging
 import wandb
 import copy
+import time
 from torch import optim
 import torch.nn.functional as F
 
@@ -96,6 +97,9 @@ class TrainWPOAgent(TrainAgent):
 
         # Total env steps counter
         self.total_env_steps = 0
+
+        # temp for logging
+        self.last_log_time = None
 
     def run(self):
         timer = Timer()
@@ -193,7 +197,10 @@ class TrainWPOAgent(TrainAgent):
                 log.info(
                     f"Itr {self.itr}: Steps {self.total_env_steps} | "
                     f"Reward {avg_reward:.4f} | "
-                    f"Loss {update_stats.get('wpo_loss', 0):.4f} | "
+                    f"Total Loss {update_stats.get('wpo_loss', 0):.4f} | \n"
+                    f"Drift Loss {update_stats.get('loss_drift', 0):.4f} | "
+                    f"KL Loss {update_stats.get('loss_kl', 0):.4f} | "
+                    f"Dual Loss {update_stats.get('loss_dual', 0):.4f} | "
                     f"Time {time:.2f}"
                 )
 
@@ -217,10 +224,9 @@ class TrainWPOAgent(TrainAgent):
         # ==========================
         # A. Critic Update
         # ==========================
-        with torch.no_grad():
-            N_TARGET_SAMPLES = 8
+        with torch.no_grad(): # Target Q-Value Calculation
+            N_TARGET_SAMPLES = 32
             # Get distribution from target actor
-            # Note: Model expects 'cond' input
             flat_obs = obs.reshape(self.batch_size, -1)
             next_dist = self.model.target_actor(flat_obs)
 
@@ -254,9 +260,7 @@ class TrainWPOAgent(TrainAgent):
 
         self.critic_optimizer.zero_grad()
         q_loss.backward()
-
         torch.nn.utils.clip_grad_norm_(self.model.critic.parameters(), max_norm=10.0)
-
         self.critic_optimizer.step()
 
         # ==========================
@@ -268,7 +272,7 @@ class TrainWPOAgent(TrainAgent):
         target_dist = self.model.target_actor(obs)  # Constraint Target
 
         # 2. Sample N actions from Current Actor
-        N_ACTOR_SAMPLES = 8
+        N_ACTOR_SAMPLES = 128
         actions_sampled = policy_dist.sample((N_ACTOR_SAMPLES,)).transpose(0, 1)
         actions_sampled.requires_grad_(True)
 
@@ -277,15 +281,16 @@ class TrainWPOAgent(TrainAgent):
         flat_sampled_actions = actions_sampled.reshape(-1, self.action_dim)
 
         # Use UPDATED critic
-        q_vals_tuple = self.model.get_q(obs_expanded, flat_sampled_actions)
-        q_vals = q_vals_tuple[0] # Use Q1's gradients for flow calculation, whichever Q is not important
-        q_sum = q_vals.sum()
+        q1, q2 = self.model.get_q(obs_expanded, flat_sampled_actions)
+        Q = q1.sum() # Use Q1's gradients for flow calculation, whichever Q is not important
+        # normalize Q with respect to the number of samples to keep scale consistent
+        Q = Q / (N_ACTOR_SAMPLES/2)
 
-        grads = torch.autograd.grad(q_sum, actions_sampled, create_graph=False)[0]
+        Q_grad_a = torch.autograd.grad(Q, actions_sampled, create_graph=False)[0]
 
         # 4. WPO Loss
         total_loss, stats = self.wpo_loss(
-            policy_dist, target_dist, actions_sampled.detach(), grads.detach()
+            policy_dist, target_dist, Q_grad_a.detach()
         )
 
         self.actor_optimizer.zero_grad()
@@ -305,7 +310,6 @@ class TrainWPOAgent(TrainAgent):
             self,
             policy_dist,
             target_policy_dist,
-            actions_sampled,
             q_grad_wrt_actions
     ):
         # 1. Unpack
@@ -316,6 +320,18 @@ class TrainWPOAgent(TrainAgent):
 
         # 2. Wasserstein Drift
         avg_q_grad = torch.mean(q_grad_wrt_actions, dim=1)
+        # warning: q grad might be exploding, consider clipping
+        # avg_q_grad = torch.clamp(avg_q_grad, -50.0, 50.0)
+
+        # log the avg_q_grad every 10 seconds
+        t = time.time()
+        if self.last_log_time is None or (t - self.last_log_time) > 10.0:
+            self.last_log_time = t
+            avg_grad_norm = torch.mean(torch.norm(avg_q_grad, dim=-1)).item()
+            log.info(f"Avg Q-Gradient Norm: {avg_grad_norm:.4f}")
+            if self.use_wandb:
+                wandb.log({"train/avg_q_grad_norm": avg_grad_norm}, step=self.itr)
+
         drift_target_mu = (sigma.pow(2) * avg_q_grad).detach()
         loss_policy_drift = -torch.sum(mu * drift_target_mu, dim=-1).mean()
 
@@ -356,8 +372,10 @@ class TrainWPOAgent(TrainAgent):
         return total_loss, {
             "wpo_loss": total_loss.item(),
             "loss_drift": loss_policy_drift.item(),
+            "loss_kl": loss_kl_penalty.item(),
             "loss_dual": loss_dual.item(),
             "kl_mean": mean_kl_mean.mean().item(),
             "kl_std": mean_kl_std.mean().item(),
-            "alpha_mean": alpha_mean.mean().item()
+            "alpha_mean": alpha_mean.mean().item(),
+            "alpha_std": alpha_std.mean().item()
         }

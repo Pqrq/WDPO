@@ -33,7 +33,7 @@ class WPOLoss(nn.Module):
         self.log_alpha_std = nn.Parameter(torch.full(shape, init_log_alpha_std))
 
     def get_alpha(self, log_alpha):
-        return F.softplus(log_alpha) + 1e-8
+        return F.softplus(log_alpha) + 1e-4
 
     def forward(
         self,
