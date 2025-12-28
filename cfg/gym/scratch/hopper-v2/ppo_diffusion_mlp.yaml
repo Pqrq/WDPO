@@ -82,7 +82,7 @@ model:
   randn_clip_value: 3
   min_sampling_denoising_std: 0.1
   min_logprob_denoising_std: 0.1
-  #
+  # Act-crt inhrtd from VPGDiffusion
   actor:
     _target_: model.diffusion.mlp_diffusion.DiffusionMLP
     horizon_steps: ${horizon_steps}

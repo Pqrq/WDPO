@@ -1,0 +1,518 @@
+# Not in Toprak, not sure whether we need this or not
+    #def sample_with_actor(self, actor, cond, deterministic=False, return_chain=True):
+    #    """
+    #    Helper to sample from the diffusion forward pass using a provided actor network.
+    #    Temporarily swap self.actor to `actor`, run forward, then restore.
+    #    Returns Sample(trajectories, chain).
+    #    """
+    #    # actor is a network with the same signature as self.actor
+    #    old_actor = self.actor
+    #    try:
+    #        self.actor = actor
+    #        with torch.no_grad():
+    #            samples = self.forward(cond, deterministic=deterministic, return_chain=return_chain)
+    #    finally:
+    #        self.actor = old_actor
+    #    return samples
+
+    # At the above code, I only changed forward function, others are copy-pasted
+    # Below do not exist in Toprak
+
+    # ---------- Sampling ----------#
+    # This one was used during my DWPO training code
+    """
+    def step(self):
+        """"""
+        Anneal min_sampling_denoising_std and fine-tuning denoising steps
+
+        Current configs do not apply annealing
+        """"""
+        # anneal min_sampling_denoising_std
+        if type(self.min_sampling_denoising_std) is not float:
+            self.min_sampling_denoising_std.step()
+
+        # anneal denoising steps
+        self.ft_denoising_steps_cnt += 1
+        if (
+            self.ft_denoising_steps_d > 0
+            and self.ft_denoising_steps_t > 0
+            and self.ft_denoising_steps_cnt % self.ft_denoising_steps_t == 0
+        ):
+            self.ft_denoising_steps = max(
+                0, self.ft_denoising_steps - self.ft_denoising_steps_d
+            )
+
+            logging.info(
+                f"Finished annealing fine-tuning denoising steps to {self.ft_denoising_steps}"
+            )
+    """    
+""" 
+    # ---------- Helpers for noise-space WPO ----------
+    def q_sample(self, x_start, t, noise=None):
+        """""" 
+        Diffuse x_start to timestep t using the forward q-process:
+          x_t = sqrt_alphas_cumprod[t] * x_start + sqrt(1 - alphas_cumprod[t]) * noise
+        If noise is None, sample standard normal noise and return (x_t, noise).
+        x_start: [B, Ta, Da] or [B, D_flat] shaped as same as actions
+        t: tensor of shape [B] (int timesteps)
+        """""" 
+        if noise is None:
+            noise = torch.randn_like(x_start)
+        # broadcast extracts to x_start shape
+        sqrt_alpha_cum = extract(self.sqrt_alphas_cumprod, t, x_start.shape)
+        sqrt_one_minus_alpha = extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape)
+        x_t = sqrt_alpha_cum * x_start + sqrt_one_minus_alpha * noise
+        return x_t, noise
+
+    def predict_eps(self, x_t, t, cond):
+        """""" 
+        Policy mean in noise-space: ε̂θ(x_t, t, cond)
+        Calls the actor network — assumes actor signature actor(x, t, cond)
+        Returns tensor shaped like x_t: [B, Ta, Da]
+        """""" 
+        return self.actor(x_t, t, cond=cond)
+
+    def eps_to_x0(self, x_t, eps, t):
+        """""" 
+        Deterministic reconstruction of x0 (action) from (x_t, eps):
+          x0 = (x_t - sqrt(1-α̅_t) * eps) / sqrt(α̅_t)
+        """""" 
+        sqrt_alpha_cum = extract(self.sqrt_alphas_cumprod, t, x_t.shape)
+        sqrt_one_minus_alpha = extract(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape)
+        x0 = (x_t - sqrt_one_minus_alpha * eps) / (sqrt_alpha_cum + 1e-12)
+        return x0
+
+
+    #def update_target_actor(self, tau):
+        #"""""" Soft update target actor weights: θ_tgt = τ*θ_curr + (1-τ)*θ_tgt"""""" 
+        #for param, target_param in zip(self.actor_ft.parameters(), self.target_actor.parameters()):
+        #    target_param.data.mul_(1 - tau)
+        #    torch.add(target_param.data, param.data, alpha=tau, out=target_param.data)
+
+    #def sample_target(self, cond, deterministic=False):
+        """""" Sample from the Target Actor (for Bellman updates)"""""" 
+        # We temporarily swap self.actor_ft with self.target_actor to reuse the forward logic
+        # or we explicitly use target_actor in p_mean_var.
+        # EASIER WAY: Create a helper in p_mean_var or just manual swap here.
+        
+        # Let's do a manual swap context to avoid rewriting p_mean_var
+        #temp_actor = self.actor_ft
+        #self.actor_ft = self.target_actor
+        
+        #try:
+            # We assume forward uses self.actor_ft (which is now target)
+            # We don't need gradients for target sampling
+        #    with torch.no_grad():
+        #        samples = self.forward(cond, deterministic=deterministic)
+        #finally:
+            # Restore
+        #    self.actor_ft = temp_actor
+            
+        #return samples
+""" 
+    #def get_min_sampling_denoising_std(self):
+    #    if type(self.min_sampling_denoising_std) is float:
+    #        return self.min_sampling_denoising_std
+    #    else:
+    #        return self.min_sampling_denoising_std()
+
+    # override
+    #def p_mean_var(
+    #    self,
+    #    x,
+    #    t,
+    #    cond,
+    #    index=None,
+    #    use_base_policy=False,
+    #    deterministic=False,
+    #):
+    #    noise = self.actor(x, t, cond=cond)
+    #    if self.use_ddim:
+    #        ft_indices = torch.where(
+    #            index >= (self.ddim_steps - self.ft_denoising_steps)
+    #        )[0]
+    #    else:
+    #        ft_indices = torch.where(t < self.ft_denoising_steps)[0]
+
+        # Use base policy to query expert model, e.g. for imitation loss
+        #actor = self.actor if use_base_policy else self.actor_ft
+
+        # overwrite noise for fine-tuning steps
+        #if len(ft_indices) > 0:
+        #    cond_ft = {key: cond[key][ft_indices] for key in cond}
+        #    noise_ft = actor(x[ft_indices], t[ft_indices], cond=cond_ft)
+        #    noise[ft_indices] = noise_ft
+
+        # Predict x_0
+        #if self.predict_epsilon:
+        #    if self.use_ddim:
+        #       """
+        #        x₀ = (xₜ - √ (1-αₜ) ε )/ √ αₜ
+        #        """
+        #        alpha = extract(self.ddim_alphas, index, x.shape)
+        #        alpha_prev = extract(self.ddim_alphas_prev, index, x.shape)
+        #        sqrt_one_minus_alpha = extract(
+        #            self.ddim_sqrt_one_minus_alphas, index, x.shape
+        #        )
+        #        x_recon = (x - sqrt_one_minus_alpha * noise) / (alpha**0.5)
+        #    else:
+        #        """
+        #        x₀ = √ 1\α̅ₜ xₜ - √ 1\α̅ₜ-1 ε
+        #        """
+        #        x_recon = (
+        #            extract(self.sqrt_recip_alphas_cumprod, t, x.shape) * x
+        #            - extract(self.sqrt_recipm1_alphas_cumprod, t, x.shape) * noise
+        #        )
+        #else:  # directly predicting x₀
+        #    x_recon = noise
+        #if self.denoised_clip_value is not None:
+        #    x_recon.clamp_(-self.denoised_clip_value, self.denoised_clip_value)
+        #    if self.use_ddim:
+        #        # re-calculate noise based on clamped x_recon - default to false in HF, but let's use it here
+        #        noise = (x - alpha ** (0.5) * x_recon) / sqrt_one_minus_alpha
+
+        # Clip epsilon for numerical stability in policy gradient - not sure if this is helpful yet, but the value can be huge sometimes. This has no effect if DDPM is used
+        #if self.use_ddim and self.eps_clip_value is not None:
+        #    noise.clamp_(-self.eps_clip_value, self.eps_clip_value)
+
+        # Get mu
+        #if self.use_ddim:
+            #"""
+            #μ = √ αₜ₋₁ x₀ + √(1-αₜ₋₁ - σₜ²) ε
+            #"""
+        #    if deterministic:
+        #        etas = torch.zeros((x.shape[0], 1, 1)).to(x.device)
+        #    else:
+        #        etas = self.eta(cond).unsqueeze(1)  # B x 1 x (Da or 1)
+        #    sigma = (
+        #        etas
+        #        * ((1 - alpha_prev) / (1 - alpha) * (1 - alpha / alpha_prev)) ** 0.5
+        #    ).clamp_(min=1e-10)
+        #    dir_xt_coef = (1.0 - alpha_prev - sigma**2).clamp_(min=0).sqrt()
+        #    mu = (alpha_prev**0.5) * x_recon + dir_xt_coef * noise
+        #    var = sigma**2
+        #    logvar = torch.log(var)
+        #else:
+            #"""
+            #μₜ = β̃ₜ √ α̅ₜ₋₁/(1-α̅ₜ)x₀ + √ αₜ (1-α̅ₜ₋₁)/(1-α̅ₜ)xₜ
+            #"""
+        #    mu = (
+        #        extract(self.ddpm_mu_coef1, t, x.shape) * x_recon
+        #        + extract(self.ddpm_mu_coef2, t, x.shape) * x
+        #    )
+        #    logvar = extract(self.ddpm_logvar_clipped, t, x.shape)
+        #    etas = torch.ones_like(mu).to(mu.device)  # always one for DDPM
+        #return mu, logvar, etas
+
+    # override #@torch.no_grad()
+    
+    
+
+    # ---------- RL training ----------#
+
+    #def get_logprobs(
+    #    self,
+    #    cond,
+    #    chains,
+    #    get_ent: bool = False,
+    #    use_base_policy: bool = False,
+    #):
+    #    """
+    #    Calculating the logprobs of the entire chain of denoised actions.
+
+    #    Args:
+    #        cond: dict with key state/rgb; more recent obs at the end
+    #            state: (B, To, Do)
+    #            rgb: (B, To, C, H, W)
+    #        chains: (B, K+1, Ta, Da)
+    #        get_ent: flag for returning entropy
+    #        use_base_policy: flag for using base policy
+
+    #    Returns:
+    #        logprobs: (B x K, Ta, Da)
+    #        entropy (if get_ent=True):  (B x K, Ta)
+        """ 
+        # Repeat cond for denoising_steps, flatten batch and time dimensions
+    #    cond = {
+    #        key: cond[key]
+    #        .unsqueeze(1)
+    #        .repeat(1, self.ft_denoising_steps, *(1,) * (cond[key].ndim - 1))
+    #        .flatten(start_dim=0, end_dim=1)
+    #        for key in cond
+    #    }  # less memory usage than einops?
+
+        # Repeat t for batch dim, keep it 1-dim
+    #    if self.use_ddim:
+    #        t_single = self.ddim_t[-self.ft_denoising_steps :]
+    #    else:
+    #        t_single = torch.arange(
+    #            start=self.ft_denoising_steps - 1,
+    #            end=-1,
+    #            step=-1,
+    #            device=self.device,
+    #        )
+            # 4,3,2,1,0,4,3,2,1,0,...,4,3,2,1,0
+    #    t_all = t_single.repeat(chains.shape[0], 1).flatten()
+    #    if self.use_ddim:
+    #        indices_single = torch.arange(
+    #            start=self.ddim_steps - self.ft_denoising_steps,
+    #            end=self.ddim_steps,
+    #            device=self.device,
+    #        )  # only used for DDIM
+    #        indices = indices_single.repeat(chains.shape[0])
+    #    else:
+    #        indices = None
+
+        # Split chains
+    #    chains_prev = chains[:, :-1]
+    #    chains_next = chains[:, 1:]
+
+        # Flatten first two dimensions
+    #    chains_prev = chains_prev.reshape(-1, self.horizon_steps, self.action_dim)
+    #    chains_next = chains_next.reshape(-1, self.horizon_steps, self.action_dim)
+
+        # Forward pass with previous chains
+    #    next_mean, logvar, eta = self.p_mean_var(
+    #        chains_prev,
+    #        t_all,
+    #        cond=cond,
+    #        index=indices,
+    #        use_base_policy=use_base_policy,
+    #    )
+    #    std = torch.exp(0.5 * logvar)
+    #    std = torch.clip(std, min=self.min_logprob_denoising_std)
+    #    dist = Normal(next_mean, std)
+
+        # Get logprobs with gaussian
+    #    log_prob = dist.log_prob(chains_next)
+    #    if get_ent:
+    #        return log_prob, eta
+    #    return log_prob
+
+    #def get_logprobs_subsample(
+    #    self,
+    #    cond,
+    #    chains_prev,
+    #    chains_next,
+    #    denoising_inds,
+    #    get_ent: bool = False,
+    #    use_base_policy: bool = False,
+    #):
+        """
+        Calculating the logprobs of random samples of denoised chains.
+
+        Args:
+            cond: dict with key state/rgb; more recent obs at the end
+                state: (B, To, Do)
+                rgb: (B, To, C, H, W)
+            chains: (B, K+1, Ta, Da)
+            get_ent: flag for returning entropy
+            use_base_policy: flag for using base policy
+
+        Returns:
+            logprobs: (B, Ta, Da)
+            entropy (if get_ent=True):  (B, Ta)
+            denoising_indices: (B, )
+        """
+        # Sample t for batch dim, keep it 1-dim
+    #    if self.use_ddim:
+    #        t_single = self.ddim_t[-self.ft_denoising_steps :]
+    #    else:
+    #        t_single = torch.arange(
+    #            start=self.ft_denoising_steps - 1,
+#                end=-1,
+#                step=-1,
+#                device=self.device,
+#            )
+            # 4,3,2,1,0,4,3,2,1,0,...,4,3,2,1,0
+#        t_all = t_single[denoising_inds]
+#        if self.use_ddim:
+#            ddim_indices_single = torch.arange(
+#                start=self.ddim_steps - self.ft_denoising_steps,
+#                end=self.ddim_steps,
+#                device=self.device,
+#            )  # only used for DDIM
+#            ddim_indices = ddim_indices_single[denoising_inds]
+#        else:
+#            ddim_indices = None
+
+        # Forward pass with previous chains
+#        next_mean, logvar, eta = self.p_mean_var(
+#            chains_prev,
+#            t_all,
+#            cond=cond,
+#            index=ddim_indices,
+#            use_base_policy=use_base_policy,
+#        )
+#        std = torch.exp(0.5 * logvar)
+#        std = torch.clip(std, min=self.min_logprob_denoising_std)
+#        dist = Normal(next_mean, std)
+#
+#        # Get logprobs with gaussian
+#        log_prob = dist.log_prob(chains_next)
+#        if get_ent:
+#            return log_prob, eta
+#        return log_prob
+    
+    # --------------------------------------------------------
+    # NEW METHODS TO ADD FOR BC REGULARIZATION
+    # --------------------------------------------------------
+
+    #def q_sample(self, x_start, t, noise=None):
+        """
+        Diffuses the data (x_start) to step t (Forward process).
+        """
+        #if noise is None:
+        #    noise = torch.randn_like(x_start)
+
+        # Assuming self.sqrt_alphas_cumprod etc. exist from parent DiffusionModel
+        #return (
+        #    extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
+        #    + extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
+        #)
+
+    #def loss_bc(self, x_start, cond):
+        """
+        Standard Diffusion Training Loss (MSE between predicted noise and actual noise).
+        Using the Trainable Model (actor_ft).
+        """
+        #batch_size = len(x_start)
+        #t = torch.randint(0, self.denoising_steps, (batch_size,), device=self.device).long()
+        #noise = torch.randn_like(x_start)
+
+        # 1. Add noise to the expert action (from buffer)
+        #x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
+
+        # 2. Predict the noise using the TRAINABLE model
+        # Note: We use actor_ft here because we want to update its weights
+        #predicted_noise = self.actor_ft(x_noisy, t, cond=cond)
+
+        # 3. MSE Loss
+        #loss = F.mse_loss(predicted_noise, noise)
+        #return loss
+    # --------------------------------------------------------
+
+    # WPG Loss (may need to adjust this, I currently hope it works correctly)
+    #def loss(
+        #self,
+        #policy_dist: Independent,
+        #target_policy_dist: Independent,
+        #q_grad_wrt_actions: torch.Tensor, # [B, N, D]
+    #):
+        # 1. Unpack Distributions (Assume Normal)
+        #mu = policy_dist.base_dist.loc
+        #sigma = policy_dist.base_dist.scale
+        #target_mu = target_policy_dist.base_dist.loc
+        #target_sigma = target_policy_dist.base_dist.scale
+
+        # 2. Wasserstein Drift (Policy Gradient)
+        # Direction = sigma^2 * E[grad_a Q]
+        #avg_q_grad = torch.mean(q_grad_wrt_actions, dim=1) # [B, D]
+        #drift_target_mu = (sigma.pow(2) * avg_q_grad).detach()
+
+        # Surrogate Loss: L = - (mu * drift) -> grad L = -drift -> grad descent = +drift
+        #loss_policy_drift = -torch.sum(mu * drift_target_mu, dim=-1).mean()
+
+        # 3. KL Constraints (MPO Decomposition)
+        #dist_fixed_std = Normal(loc=mu, scale=target_sigma.detach())
+        #dist_fixed_mean = Normal(loc=target_mu.detach(), scale=sigma)
+        #target_dist_base = Normal(loc=target_mu.detach(), scale=target_sigma.detach())
+
+        #kl_mean = kl_divergence(target_dist_base, dist_fixed_std)
+        #kl_std = kl_divergence(target_dist_base, dist_fixed_mean)
+
+        #if not self.per_dim_constraining:
+        #    kl_mean = kl_mean.sum(dim=-1, keepdim=True)
+        #    kl_std = kl_std.sum(dim=-1, keepdim=True)
+
+        #mean_kl_mean = kl_mean.mean(dim=0)
+        #mean_kl_std = kl_std.mean(dim=0)
+
+        # 4. Dual Losses
+        #alpha_mean = self.get_alpha(self.log_alpha_mean)
+        """
+        
+        alpha_std = self.get_alpha(self.log_alpha_std)
+
+        alpha_mean = torch.clamp(alpha_mean, max=100.0)
+        alpha_std = torch.clamp(alpha_std, max=100.0)
+
+        # Penalty term (for policy)
+        loss_kl_penalty = torch.sum(alpha_mean.detach() * mean_kl_mean) + \
+                          torch.sum(alpha_std.detach() * mean_kl_std)
+
+        # Dual term (for alpha update)
+        loss_dual = torch.sum(alpha_mean * (self.epsilon_mean - mean_kl_mean.detach())) + \
+                    torch.sum(alpha_std * (self.epsilon_std - mean_kl_std.detach()))
+
+        # Total
+        total_loss = (
+            self.policy_loss_scale * loss_policy_drift +
+            self.kl_loss_scale * loss_kl_penalty +
+            self.dual_loss_scale * loss_dual
+        )
+
+        stats = {
+            "wpo_loss": total_loss.item(),
+            "loss_policy": loss_policy_drift.item(),
+            "loss_kl_penalty": loss_kl_penalty.item(),
+            "loss_dual": loss_dual.item(),
+            "kl_mean": mean_kl_mean.mean().item(),
+            "kl_std": mean_kl_std.mean().item(),
+            "alpha_mean": alpha_mean.mean().item(),
+            "alpha_std": alpha_std.mean().item()
+        }
+
+        return total_loss, stats
+
+
+
+
+
+
+
+
+
+
+    # Previous VPG Loss (its old name was just `loss`)
+    #def old_vpg_loss(self, cond, chains, reward):
+        """
+        """REINFORCE loss. Not used right now.
+
+        Args:
+            cond: dict with key state/rgb; more recent obs at the end
+                state: (B, To, Do)
+                rgb: (B, To, C, H, W)
+            chains: (B, K+1, Ta, Da)
+            reward (to go): (b,)
+        """"""
+        # Get advantage
+        with torch.no_grad():
+            value = self.critic(cond).squeeze()
+        advantage = reward - value
+
+        # Get logprobs for denoising steps from T-1 to 0
+        logprobs, eta = self.get_logprobs(cond, chains, get_ent=True)
+        # (n_steps x n_envs x K) x Ta x (Do+Da)
+
+        # Ignore obs dimension, and then sum over action dimension
+        logprobs = logprobs[:, :, : self.action_dim].sum(-1)
+        # -> (n_steps x n_envs x K) x Ta
+
+        # -> (n_steps x n_envs) x K x Ta
+        logprobs = logprobs.reshape((-1, self.denoising_steps, self.horizon_steps))
+
+        # Sum/avg over denoising steps
+        logprobs = logprobs.mean(-2)  # -> (n_steps x n_envs) x Ta
+
+        # Sum/avg over horizon steps
+        logprobs = logprobs.mean(-1)  # -> (n_steps x n_envs)
+
+        # Get REINFORCE loss
+        loss_actor = torch.mean(-logprobs * advantage)
+
+        # Train critic to predict state value
+        pred = self.critic(cond).squeeze()
+        loss_critic = F.mse_loss(pred, reward)
+        return loss_actor, loss_critic, eta
+"""

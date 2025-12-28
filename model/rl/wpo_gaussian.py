@@ -50,7 +50,7 @@ class WPO_Gaussian(nn.Module):
             **kwargs
     ):
         super().__init__()
-        self.device = device
+        
         self.action_dim = action_dim
 
         # 1. Instantiate Custom Actor

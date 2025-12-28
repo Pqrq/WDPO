@@ -45,10 +45,10 @@ train:
   gamma: 0.99
 
   # WPO Specifics
-  epsilon_mean: 0.008
+  epsilon_mean: 0.05
   epsilon_std: 0.001
-  init_log_alpha_mean: -3.0
-  init_log_alpha_std: -3.0
+  init_log_alpha_mean: 0.0
+  init_log_alpha_std: 0.0
   policy_loss_scale: 1.0
   kl_loss_scale: 1.0
   dual_loss_scale: 1.0
@@ -59,7 +59,7 @@ train:
   # Optimization
   actor_lr: 3e-4
   critic_lr: 1e-3
-  dual_lr: 3e-5
+  dual_lr: 5e-4
   batch_size: 256
 
   # Buffer
@@ -72,6 +72,8 @@ train:
     freq: 1
     num: 0
 
+# We will change the main model and actor. I think critic will remain constant
+# Main model should be something like WPO_Diffusion and actor will probably be a DiffusionMLP
 model:
   _target_: model.rl.wpo_gaussian.WPO_Gaussian
   _recursive_: False

@@ -1,0 +1,86 @@
+gym:
+  scratch:
+    hopper-v2:
+      name: ${env_name}_wpo_mlp_ta${horizon_steps}
+      logdir: ${oc.env:DPPO_LOG_DIR}/gym-finetune/${name}/${now:%Y-%m-%d}_${now:%H-%M-%S}_${seed}
+      hydra:
+        run:
+          dir: ${logdir}
+      _target_: agent.finetune.train_wpo_agent.TrainWPOAgent
+      normalization_path: ${oc.env:DPPO_DATA_DIR}/gym/${env_name}/normalization.npz
+      seed: 42
+      device: cuda:0
+      env_name: hopper-medium-v2
+      obs_dim: 11
+      action_dim: 3
+      cond_steps: 1
+      horizon_steps: 1
+      act_steps: 1
+      env:
+        n_envs: 10
+        name: ${env_name}
+        max_episode_steps: 1000
+        reset_at_iteration: false
+        save_video: false
+        best_reward_threshold_for_success: 3
+        wrappers:
+          mujoco_locomotion_lowdim:
+            normalization_path: ${normalization_path}
+          multi_step:
+            n_obs_steps: ${cond_steps}
+            n_action_steps: ${act_steps}
+            max_episode_steps: ${env.max_episode_steps}
+            reset_within_step: true
+      wandb:
+        entity: ${oc.env:DPPO_WANDB_ENTITY}
+        project: gym-${env_name}-wpo
+        run: ${now:%H-%M-%S}_${name}
+      train:
+        n_train_itr: 301
+        n_steps: 1000
+        gamma: 0.99
+        epsilon_mean: 0.05
+        epsilon_std: 0.001
+        init_log_alpha_mean: 0.0
+        init_log_alpha_std: 0.0
+        policy_loss_scale: 1.0
+        kl_loss_scale: 1.0
+        dual_loss_scale: 1.0
+        per_dim_constraining: true
+        target_update_period: 1000
+        tau: 0.005
+        actor_lr: 0.0003
+        critic_lr: 0.001
+        dual_lr: 0.0005
+        batch_size: 256
+        buffer_size: 1000000
+        warmup_steps: 5000
+        save_model_freq: 100
+        val_freq: 10
+        render:
+          freq: 1
+          num: 0
+      model:
+        _target_: model.rl.wpo_gaussian.WPO_Gaussian
+        _recursive_: false
+        action_dim: ${action_dim}
+        init_log_alpha_mean: ${train.init_log_alpha_mean}
+        init_log_alpha_std: ${train.init_log_alpha_std}
+        per_dim_constraining: ${train.per_dim_constraining}
+        actor:
+          mlp_dims:
+          - 256
+          - 256
+          - 256
+          cond_dim: ${eval:'${obs_dim} * ${cond_steps}'}
+        critic:
+          _target_: model.common.critic.CriticObsAct
+          cond_dim: ${eval:'${obs_dim} * ${cond_steps}'}
+          mlp_dims:
+          - 256
+          - 256
+          - 256
+          activation_type: Mish
+          double_q: false
+        horizon_steps: ${horizon_steps}
+        device: ${device}

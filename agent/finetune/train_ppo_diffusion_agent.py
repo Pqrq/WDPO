@@ -102,7 +102,7 @@ class TrainPPODiffusionAgent(TrainPPOAgent):
                 if step % 10 == 0:
                     print(f"Processed step {step} of {self.n_steps}")
 
-                # Select action
+                # Select action (Choose this one)
                 with torch.no_grad():
                     cond = {
                         "state": torch.from_numpy(prev_obs_venv["state"])

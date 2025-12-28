@@ -1,0 +1,119 @@
+defaults:
+  - _self_
+hydra:
+  run:
+    dir: ${logdir}
+_target_: agent.finetune.v1_train_wpo_diffusion_agent.TrainWPODiffusionAgent
+
+name: ${env_name}_wpo_diff_ta${horizon_steps}
+logdir: ${oc.env:DPPO_LOG_DIR}/gym-finetune/${name}/${now:%Y-%m-%d}_${now:%H-%M-%S}_${seed}
+normalization_path: ${oc.env:DPPO_DATA_DIR}/gym/${env_name}/normalization.npz
+base_policy_path: ${oc.env:DPPO_LOG_DIR}/gym-pretrain/hopper-medium-v2_pre_diffusion_mlp_ta4_td20/2024-06-12_23-10-05/checkpoint/state_3000.pt
+
+seed: 42
+device: cuda:0
+env_name: hopper-medium-v2
+obs_dim: 11
+action_dim: 3
+denoising_steps: 20
+ft_denoising_steps: 10 
+cond_steps: 1
+horizon_steps: 4 # Can be 4
+act_steps: 4 # Can be 4
+
+env:
+  n_envs: 40
+  name: ${env_name}
+  max_episode_steps: 1000 # Usually it was 1000
+  reset_at_iteration: False
+  save_video: False
+  best_reward_threshold_for_success: 3
+  wrappers:
+    mujoco_locomotion_lowdim:
+      normalization_path: ${normalization_path}
+    multi_step:
+      n_obs_steps: ${cond_steps}
+      n_action_steps: ${act_steps} # Env expects chunks of 4
+      max_episode_steps: ${env.max_episode_steps}
+      reset_within_step: True
+
+wandb:
+  entity: ${oc.env:DPPO_WANDB_ENTITY}
+  project: gym-${env_name}-wpo
+  run: ${now:%H-%M-%S}_${name}
+
+train:
+  n_train_itr: 1000 # Usually it was 1000
+  n_steps: 1000 # Usually it was 1000
+  gamma: 0.99
+  
+  # --- WPO Specifics ---
+  # LOWER EPSILON: Trust region must be small for stable drift
+  epsilon_mean: 0.2 # 0.05 can be tried as well  
+  epsilon_std: 0.05
+  init_log_alpha_mean: 0.0 # -1.0 can be tried
+  init_log_alpha_std: 0.0 # -1.0 can be tried
+
+  policy_loss_scale: 2.0
+  kl_loss_scale: 1.0   # Initially 0.5   
+  dual_loss_scale: 0.0  #  Initially 1.0  
+
+  per_dim_constraining: True
+  target_update_period: 1000 # Usually it was 1000
+  tau: 0.005
+
+  # --- Optimization ---
+  actor_lr: 3e-4         
+  critic_lr: 3e-4         # Slightly lower critic LR to prevent instability
+  dual_lr: 5e-5
+  batch_size: 256         
+  update_epochs: 10
+
+  # --- Buffer ---
+  buffer_size: 1000000
+  warmup_steps: 2000      
+  save_model_freq: 100
+  val_freq: 10
+  render:
+    freq: 1
+    num: 0
+
+model:
+  _target_: model.diffusion.diffusion_wpo.WPODiffusion 
+  _recursive_: True 
+
+  # --- Parent Class Arguments ---
+  device: ${device}
+  gamma_denoising: 0.99
+  action_dim: 3
+  horizon_steps: ${horizon_steps}
+  obs_dim: ${obs_dim}
+  denoising_steps: ${denoising_steps}
+  ft_denoising_steps: ${ft_denoising_steps}
+  
+  # --- Other Parameters ---
+  min_sampling_denoising_std: 0.1 
+  min_logprob_denoising_std: 0.1
+  init_log_alpha_mean: ${train.init_log_alpha_mean}
+  init_log_alpha_std: ${train.init_log_alpha_std}
+  per_dim_constraining: ${train.per_dim_constraining}
+  network_path: ${base_policy_path}
+
+  # --- Sub-components ---
+  actor:
+    _target_: model.diffusion.mlp_diffusion.DiffusionMLP
+    action_dim: ${action_dim}
+    horizon_steps: ${horizon_steps}
+    cond_dim: ${eval:'${obs_dim} * ${cond_steps}'}
+    time_dim: 16
+    mlp_dims: [512, 512, 512]
+    activation_type: ReLU
+    residual_style: True 
+
+  critic:
+    _target_: model.common.critic.CriticObsAct
+    action_dim: ${action_dim}
+    action_steps: ${act_steps} 
+    cond_dim: ${eval:'${obs_dim} * ${cond_steps}'}
+    mlp_dims: [256, 256, 256]
+    double_q: True

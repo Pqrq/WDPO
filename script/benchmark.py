@@ -9,7 +9,7 @@ from stable_baselines3 import PPO, SAC
 from stable_baselines3.common.callbacks import BaseCallback
 
 # Adjust imports to match your file structure
-from agent.finetune.train_wpo_agent import WPOAgent
+from agent.finetune.train_wpo_agent import TrainWPOAgent
 from env.bandit import ContinuousBanditEnv
 
 
@@ -37,7 +37,7 @@ def train_benchmark(
 
     # --- 1. Train WPO ---
     print(f"--- Training WPO (Seed {seed}) ---")
-    wpo_agent = WPOAgent(
+    wpo_agent = TrainWPOAgent(
         env=env,
         device="cuda" if torch.cuda.is_available() else "cpu",
         actor_hidden_dim=64,
